@@ -1,0 +1,339 @@
+name: lakehouse-iceberg-stream
+
+# Postgres --(Flink CDC)--> Fluss (hot: log + PK tables) --(tiering service)-->
+# Iceberg (cold, via Polaris REST catalog) --stored on--> SeaweedFS (S3-compatible).
+#
+# This is the sibling comparison to stream-debezium-kafka: same e-commerce
+# source schema and seed data, but Fluss replaces Kafka+Debezium+Kafka Connect
+# as the streaming middle tier, and SeaweedFS replaces MinIO as the object
+# store underneath the lakehouse. See README.md for the full writeup,
+# including what did and didn't work as documented.
+
+services:
+
+  # ── Object storage (replaces MinIO) ─────────────────────────────────────
+  # `weed mini` bundles master+volume+filer+S3 gateway+Iceberg REST catalog
+  # in one process -- the SeaweedFS-recommended way to run a single-node
+  # instance. We use the S3 gateway only; Iceberg goes through Polaris.
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: >
+      mini -dir=/data
+      -s3.port=8333
+      -master.port=9333
+      -filer.port=8888
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123}
+    ports:
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # Filer UI
+      - "9333:9333"   # Master UI
+      - "23646:23646" # Admin UI
+    volumes:
+      - seaweedfs_data:/data
+    healthcheck:
+      # Auth is enabled (AWS_ACCESS_KEY_ID/SECRET set above), so an
+      # unauthenticated GET returns 403 -- that still proves the S3 gateway
+      # is listening and answering, which is all this needs to confirm.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8333/ | grep -qE '^(200|403)$' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Creates the lakehouse + fluss buckets on first start (same role as
+  # minio-init in lakehouse-iceberg-batch).
+  seaweedfs-init:
+    image: minio/mc:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://seaweedfs:8333 ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin} ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123} &&
+        mc mb --ignore-existing local/${LAKEHOUSE_BUCKET:-lakehouse} &&
+        mc mb --ignore-existing local/${FLUSS_BUCKET:-fluss} &&
+        echo 'Buckets ready.'
+      "
+
+  # ── Polaris metastore backend ───────────────────────────────────────────
+  polaris-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POLARIS_DB:-polaris}
+      POSTGRES_USER: ${POLARIS_DB_USER:-polaris}
+      POSTGRES_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris}
+    volumes:
+      - polaris_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POLARIS_DB_USER:-polaris}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Iceberg REST catalog ────────────────────────────────────────────────
+  polaris:
+    image: apache/polaris:1.6.0
+    depends_on:
+      polaris-postgres:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "8181:8181"
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_AUTO_BOOTSTRAP_TYPES: relational-jdbc
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_USERNAME: ${POLARIS_DB_USER:-polaris}
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polaris}
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://polaris-postgres:5432/${POLARIS_DB:-polaris}
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_BOOTSTRAP_CREDENTIALS:-POLARIS,root,secret}
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123}
+      AWS_ENDPOINT_URL_STS: http://seaweedfs:8333
+      AWS_ENDPOINT_URL_S3: http://seaweedfs:8333
+      AWS_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  polaris-creds-init:
+    image: busybox
+    user: root
+    volumes:
+      - ./polaris:/polaris
+    command: ["sh", "-c", "touch /polaris/creds.env && chmod 666 /polaris/creds.env"]
+
+  polaris-bootstrap:
+    image: curlimages/curl:latest
+    depends_on:
+      polaris:
+        condition: service_healthy
+      polaris-creds-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./polaris:/polaris
+    entrypoint: ["sh", "/polaris/bootstrap.sh"]
+    environment:
+      POLARIS_URL: http://polaris:8181
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_BOOTSTRAP_CREDENTIALS:-POLARIS,root,secret}
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin}
+      S3_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      CREDS_FILE: /polaris/creds.env
+
+  # ── CDC source ───────────────────────────────────────────────────────────
+  source-postgres:
+    image: postgres:16.14-alpine
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c max_connections=100
+    environment:
+      POSTGRES_USER: ${SOURCE_PG_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${SOURCE_PG_PASSWORD:-ecommerce}
+      POSTGRES_DB: ${SOURCE_PG_DB:-ecommerce}
+    ports:
+      - "5434:5432"
+    volumes:
+      - source_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_PG_USER:-ecommerce} -d ${SOURCE_PG_DB:-ecommerce}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Fluss cluster (replaces Kafka) ──────────────────────────────────────
+  zookeeper:
+    image: zookeeper:3.9.2
+    restart: unless-stopped
+
+  fluss-coordinator:
+    build: ./fluss
+    command: coordinatorServer
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_started
+      seaweedfs-init:
+        condition: service_completed_successfully
+      # Coordinator needs real FLUSS_CLIENT_ID/SECRET (below) before it can
+      # build a working Iceberg catalog client, so it must wait for Polaris
+      # bootstrap to actually generate and write them to creds.env.
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      # $$FLUSS_CLIENT_ID / $$FLUSS_CLIENT_SECRET are intentionally escaped
+      # ($$ -> literal $) so Compose does NOT interpolate them at "up" time
+      # (creds.env doesn't exist yet when this file is parsed). Instead they
+      # stay as literal ${FLUSS_CLIENT_ID}/${FLUSS_CLIENT_SECRET} inside the
+      # container, where the Fluss image's own entrypoint.sh runs envsubst
+      # over server.yaml -- picking up the real values from env_file below.
+      FLUSS_PROPERTIES: |
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://fluss-coordinator:9123
+        advertised.listeners: FLUSS://fluss-coordinator:9123
+        internal.listener.name: FLUSS
+        remote.data.dir: s3://${FLUSS_BUCKET:-fluss}/remote-data
+        s3.endpoint: http://seaweedfs:8333
+        s3.access-key: ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin}
+        s3.secret-key: ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123}
+        s3.region: us-east-1
+        s3.path-style-access: true
+        datalake.format: iceberg
+        datalake.iceberg.type: rest
+        datalake.iceberg.uri: http://polaris:8181/api/catalog
+        datalake.iceberg.warehouse: lakehouse
+        datalake.iceberg.oauth2-server-uri: http://polaris:8181/api/catalog/v1/oauth/tokens
+        datalake.iceberg.credential: $$FLUSS_CLIENT_ID:$$FLUSS_CLIENT_SECRET
+        datalake.iceberg.scope: PRINCIPAL_ROLE:ALL
+        datalake.iceberg.header.X-Iceberg-Access-Delegation: vended-credentials
+        datalake.iceberg.s3.endpoint: http://seaweedfs:8333
+        datalake.iceberg.s3.path-style-access: true
+        datalake.iceberg.s3.region: us-east-1
+        # Without this, Iceberg's ResolvingFileIO falls back to
+        # HadoopFileIO for s3:// paths, which throws "No FileSystem for
+        # scheme s3" (Hadoop's S3AFileSystem isn't on the classpath here,
+        # by design -- iceberg-aws-bundle is the S3 client we actually
+        # installed). Forcing S3FileIO explicitly is what makes it use it.
+        datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    ports:
+      - "9123:9123"
+    volumes:
+      # Mounted, not env_file: the fluss image's docker-entrypoint-wrapper.sh
+      # sources this file itself at container *start* (every start, every
+      # restart) -- see fluss/Dockerfile for why env_file's create-time
+      # snapshot isn't good enough here.
+      - ./polaris/creds.env:/polaris/creds.env:ro
+
+  # Fixes ownership of the fluss_tablet_data named volume before the tablet
+  # server starts. Docker creates named volumes root-owned on first use;
+  # apache/fluss's image runs as uid 9999 (the "fluss" user), which can't
+  # write to a root-owned dir. Without this, the tablet server crash-loops
+  # on "Permission denied" writing its recovery checkpoint.
+  fluss-tablet-data-init:
+    image: busybox
+    user: root
+    command: ["sh", "-c", "mkdir -p /tmp/fluss && chown -R 9999:9999 /tmp/fluss"]
+    volumes:
+      - fluss_tablet_data:/tmp/fluss
+
+  fluss-tablet:
+    build: ./fluss
+    command: tabletServer
+    restart: unless-stopped
+    depends_on:
+      fluss-coordinator:
+        condition: service_started
+      fluss-tablet-data-init:
+        condition: service_completed_successfully
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://fluss-tablet:9123
+        advertised.listeners: FLUSS://fluss-tablet:9123
+        internal.listener.name: FLUSS
+        tablet-server.id: 0
+        data.dir: /tmp/fluss/data
+        remote.data.dir: s3://${FLUSS_BUCKET:-fluss}/remote-data
+        s3.endpoint: http://seaweedfs:8333
+        s3.access-key: ${SEAWEEDFS_ACCESS_KEY:-seaweedadmin}
+        s3.secret-key: ${SEAWEEDFS_SECRET_KEY:-seaweedadmin123}
+        s3.region: us-east-1
+        s3.path-style-access: true
+        datalake.format: iceberg
+        datalake.iceberg.type: rest
+        datalake.iceberg.uri: http://polaris:8181/api/catalog
+        datalake.iceberg.warehouse: lakehouse
+        datalake.iceberg.oauth2-server-uri: http://polaris:8181/api/catalog/v1/oauth/tokens
+        datalake.iceberg.credential: $$FLUSS_CLIENT_ID:$$FLUSS_CLIENT_SECRET
+        datalake.iceberg.scope: PRINCIPAL_ROLE:ALL
+        datalake.iceberg.header.X-Iceberg-Access-Delegation: vended-credentials
+        datalake.iceberg.s3.endpoint: http://seaweedfs:8333
+        datalake.iceberg.s3.path-style-access: true
+        datalake.iceberg.s3.region: us-east-1
+        datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    ports:
+      - "9124:9123"
+    volumes:
+      - fluss_tablet_data:/tmp/fluss
+      - ./polaris/creds.env:/polaris/creds.env:ro
+
+  # ── Flink cluster (runs the CDC pipeline job + the Fluss tiering service) ─
+  flink-jobmanager:
+    build: ./flink
+    command: jobmanager
+    restart: unless-stopped
+    depends_on:
+      fluss-coordinator:
+        condition: service_started
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    ports:
+      - "8082:8081"
+    volumes:
+      # Read-only access to the Polaris-generated tiering credentials, so
+      # /opt/flink-cdc-pipelines/run-tiering-service.sh (baked into the
+      # image from flink/run-tiering-service.sh) can source
+      # FLUSS_CLIENT_ID/SECRET without them being baked into the image or
+      # this compose file.
+      - ./polaris/creds.env:/polaris/creds.env:ro
+
+  flink-taskmanager:
+    build: ./flink
+    command: taskmanager
+    restart: unless-stopped
+    depends_on:
+      - flink-jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        # 6 slots in use: CDC pipeline (parallelism 2) + 2 tiering jobs +
+        # silver job + gold job (parallelism 1 each). 8 leaves headroom for a
+        # restart overlapping with a resubmit.
+        taskmanager.numberOfTaskSlots: 8
+        taskmanager.memory.process.size: 4096m
+        taskmanager.memory.framework.off-heap.size: 256m
+        # Default 0.4 managed fraction is reserved for RocksDB / batch
+        # operators, neither used here -- the medallion's join/aggregate
+        # state lives on the JVM heap (hashmap backend), so give it the heap.
+        taskmanager.memory.managed.fraction: 0.1
+
+  # ── Query engine ────────────────────────────────────────────────────────
+  trino:
+    image: trinodb/trino:483
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    entrypoint: ["/bin/sh", "-c",
+      "set -a && . /polaris/creds.env && set +a && exec /usr/lib/trino/bin/run-trino"]
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+      - ./polaris/creds.env:/polaris/creds.env:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+volumes:
+  seaweedfs_data:
+  polaris_postgres_data:
+  source_pgdata:
+  fluss_tablet_data:

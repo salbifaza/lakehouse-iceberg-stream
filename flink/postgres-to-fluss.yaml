@@ -1,0 +1,59 @@
+################################################################################
+# Postgres -> Fluss CDC pipeline. Submitted via flink-cdc.sh against the
+# Flink standalone cluster. Captures all six e-commerce tables in one
+# pipeline job -- Flink CDC's multi-table sync, unlike stream-debezium-kafka
+# where each table becomes an independent Kafka topic wired up by Kafka
+# Connect's generic JDBC-style config.
+################################################################################
+source:
+  type: postgres
+  name: Postgres Source
+  hostname: source-postgres
+  port: 5432
+  username: ${SOURCE_PG_USER}
+  password: ${SOURCE_PG_PASSWORD}
+  tables: ${SOURCE_PG_DB}.public.(categories|customers|products|orders|order_items|payments)
+  decoding.plugin.name: pgoutput
+  slot.name: flink_cdc_slot
+  schema-change.enabled: true
+
+# No transform block needed: postgres/init/01_schema.sql uses plain
+# TIMESTAMP columns (not TIMESTAMPTZ) specifically so this pipeline doesn't
+# need one. See the comment at the top of that file for why -- Fluss
+# doesn't support TIMESTAMP WITH TIME ZONE, and the obvious workaround
+# (CAST(... AS TIMESTAMP) in a transform rule) hits a separate upstream bug
+# in Flink CDC 3.6.0's transform module before the cast ever runs.
+
+# Bronze layer: every captured table lands in Fluss database `bronze` (and
+# so, via tiering, in Iceberg namespace `bronze`), keeping its source table
+# name. The Postgres pipeline source emits (schema, table) TableIds by
+# default (table-id.include-database=false), so the source side of the
+# pattern is `public.<table>`. Bronze holds *current state*: Fluss PK
+# tables, with UPDATE/DELETE applied, not an append-only change log.
+route:
+  - source-table: public.\.*
+    sink-table: bronze.<>
+    replace-symbol: <>
+    description: land all captured source tables in the bronze layer
+
+sink:
+  type: fluss
+  name: Fluss Sink
+  bootstrap.servers: fluss-coordinator:9123
+  # Enables the datalake tiering path for every table this pipeline creates
+  # (see fluss-coordinator's datalake.* config in docker-compose.yml for
+  # where it tiers to). Without this, tables sit in Fluss only -- Fluss
+  # itself would never age their data down into Iceberg.
+  #
+  # The "properties.table." prefix strips down to a literal "table." before
+  # being forwarded as a raw Fluss table property -- confirmed by testing
+  # the wrong doubled form ("properties.table.table.datalake.enabled")
+  # first, which produced an InvalidConfigException quoting back the
+  # literal, doubled "table.table.datalake.freshness" property name it had
+  # tried to apply.
+  properties.table.datalake.enabled: "true"
+  properties.table.datalake.freshness: "30s"
+
+pipeline:
+  name: Postgres to Fluss Pipeline
+  parallelism: 2

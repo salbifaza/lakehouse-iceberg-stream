@@ -1,0 +1,187 @@
+#!/bin/sh
+# Bootstrap the Polaris catalog: create catalog, namespace, principals, and
+# grants. Runs once as a Docker Compose one-shot service after Polaris is
+# healthy. Same pattern as lakehouse-iceberg-batch/polaris/bootstrap.sh,
+# adapted for SeaweedFS as the storage backend and a single "ecommerce"
+# namespace (this project has one data domain, not three).
+#
+# Polaris v1.6.0 auto-generates clientId and clientSecret for each principal
+# regardless of what the request body contains. This script captures the
+# actual credentials from the creation response and writes them to
+# /polaris/creds.env (bind-mounted from the host) so Flink (tiering service)
+# and Trino can load the real credentials at startup.
+set -e
+
+POLARIS_URL="${POLARIS_URL:-http://polaris:8181}"
+CREDS="${POLARIS_BOOTSTRAP_CREDENTIALS:-POLARIS,root,secret}"
+S3_ENDPOINT="${S3_ENDPOINT:-http://seaweedfs:8333}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY}"
+S3_SECRET_KEY="${S3_SECRET_KEY}"
+LAKEHOUSE_BUCKET="${LAKEHOUSE_BUCKET:-lakehouse}"
+CREDS_FILE="${CREDS_FILE:-/polaris/creds.env}"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+token() {
+  curl -sf -X POST "${POLARIS_URL}/api/catalog/v1/oauth/tokens" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=client_credentials&client_id=${1}&client_secret=${2}&scope=PRINCIPAL_ROLE:ALL" \
+    | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4
+}
+
+put() {
+  code=$(curl -s -o /tmp/put_out -w "%{http_code}" -X PUT "${POLARIS_URL}/api/management/v1${1}" \
+    -H "Authorization: Bearer ${ROOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "${2}")
+  cat /tmp/put_out
+  [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "409" ] || \
+    { echo "PUT ${1} failed: HTTP $code"; exit 1; }
+}
+
+# Create a principal; on 201 capture the generated credentials into shell variables.
+# On 409 (already exists) the credentials from the original run remain in $CREDS_FILE.
+create_principal() {
+  local name="$1"
+  local var_prefix="$2"
+
+  code=$(curl -s -o /tmp/principal_out -w "%{http_code}" \
+    -X POST "${POLARIS_URL}/api/management/v1/principals" \
+    -H "Authorization: Bearer ${ROOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"principal\": {\"name\": \"${name}\"}}")
+
+  if [ "$code" = "201" ]; then
+    eval "${var_prefix}_REAL_ID=$(grep -o '"clientId":"[^"]*"' /tmp/principal_out | tail -1 | cut -d'"' -f4)"
+    eval "${var_prefix}_REAL_SECRET=$(grep -o '"clientSecret":"[^"]*"' /tmp/principal_out | cut -d'"' -f4)"
+    CREDS_WRITTEN=true
+    echo "Principal '${name}' created: clientId=$(eval echo "\$${var_prefix}_REAL_ID")"
+  elif [ "$code" = "409" ]; then
+    echo "Principal '${name}' already exists — credentials unchanged."
+  else
+    echo "Failed to create principal '${name}': HTTP $code"
+    cat /tmp/principal_out
+    exit 1
+  fi
+}
+
+ROOT_TOKEN="$(token "$(echo "$CREDS" | cut -d, -f2)" "$(echo "$CREDS" | cut -d, -f3)")"
+echo "Bootstrap token obtained."
+
+# ── catalog ──────────────────────────────────────────────────────────────────
+
+curl -s -o /tmp/mgmt_out -w "%{http_code}" -X POST "${POLARIS_URL}/api/management/v1/catalogs" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$(cat <<JSON
+{
+  "catalog": {
+    "name": "lakehouse",
+    "type": "INTERNAL",
+    "properties": {
+      "default-base-location": "s3://${LAKEHOUSE_BUCKET}/",
+      "s3.endpoint": "${S3_ENDPOINT}",
+      "s3.path-style-access": "true",
+      "s3.access-key-id": "${S3_ACCESS_KEY}",
+      "s3.secret-access-key": "${S3_SECRET_KEY}"
+    },
+    "storageConfigInfo": {
+      "storageType": "S3",
+      "allowedLocations": ["s3://${LAKEHOUSE_BUCKET}/"],
+      "region": "us-east-1",
+      "pathStyleAccess": true
+    }
+  }
+}
+JSON
+)" | grep -qE "^(200|201|409)$" || { echo "Catalog creation failed"; exit 1; }
+echo "Catalog 'lakehouse' ready."
+
+# ── namespace ────────────────────────────────────────────────────────────────
+# One data domain for this project (ecommerce), unlike lakehouse-iceberg-batch's
+# three (weather/market/web).
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${POLARIS_URL}/api/catalog/v1/lakehouse/namespaces" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"namespace": ["ecommerce"]}')
+[ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "409" ] || \
+  { echo "Namespace ecommerce failed: HTTP $code"; exit 1; }
+echo "Namespace 'ecommerce' ready."
+
+# ── principals ────────────────────────────────────────────────────────────────
+# fluss_tiering: the identity Fluss's datalake tiering service uses to write
+# Iceberg table metadata + commits. analyst: read-only, used by Trino.
+
+CREDS_WRITTEN=false
+
+create_principal fluss_tiering FLUSS
+create_principal analyst        ANALYST
+
+if [ "$CREDS_WRITTEN" = "true" ]; then
+  cat > "$CREDS_FILE" <<EOF
+# Auto-generated by polaris/bootstrap.sh — do not edit manually.
+FLUSS_CLIENT_ID=${FLUSS_REAL_ID}
+FLUSS_CLIENT_SECRET=${FLUSS_REAL_SECRET}
+ANALYST_CLIENT_ID=${ANALYST_REAL_ID}
+ANALYST_CLIENT_SECRET=${ANALYST_REAL_SECRET}
+EOF
+  echo "Credentials written to ${CREDS_FILE}."
+else
+  echo "Principals already existed — using credentials from ${CREDS_FILE}."
+fi
+
+# ── principal roles ───────────────────────────────────────────────────────────
+
+for role in writer reader; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "${POLARIS_URL}/api/management/v1/principal-roles" \
+    -H "Authorization: Bearer ${ROOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"principalRole\": {\"name\": \"${role}\"}}")
+  [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "409" ] || \
+    { echo "Principal role ${role} failed: HTTP $code"; exit 1; }
+  echo "Principal role '${role}' ready."
+done
+
+put "/principals/fluss_tiering/principal-roles" '{"principalRole": {"name": "writer"}}'
+put "/principals/analyst/principal-roles"       '{"principalRole": {"name": "reader"}}'
+
+# ── catalog roles and grants ──────────────────────────────────────────────────
+
+for role in write-role read-role; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "${POLARIS_URL}/api/management/v1/catalogs/lakehouse/catalog-roles" \
+    -H "Authorization: Bearer ${ROOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"catalogRole\": {\"name\": \"${role}\"}}")
+  [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "409" ] || \
+    { echo "Catalog role ${role} failed: HTTP $code"; exit 1; }
+done
+
+put "/catalogs/lakehouse/catalog-roles/write-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "NAMESPACE_LIST"}}'
+put "/catalogs/lakehouse/catalog-roles/write-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "TABLE_LIST"}}'
+put "/catalogs/lakehouse/catalog-roles/write-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}}'
+for priv in NAMESPACE_FULL_METADATA TABLE_FULL_METADATA TABLE_READ_DATA TABLE_WRITE_DATA TABLE_CREATE; do
+  put "/catalogs/lakehouse/catalog-roles/write-role/grants" \
+    "{\"grant\": {\"type\": \"namespace\", \"namespace\": [\"ecommerce\"], \"privilege\": \"${priv}\"}}"
+done
+
+put "/catalogs/lakehouse/catalog-roles/read-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "NAMESPACE_LIST"}}'
+put "/catalogs/lakehouse/catalog-roles/read-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "TABLE_LIST"}}'
+put "/catalogs/lakehouse/catalog-roles/read-role/grants" \
+  '{"grant": {"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}}'
+for priv in NAMESPACE_FULL_METADATA TABLE_FULL_METADATA TABLE_READ_DATA TABLE_LIST; do
+  put "/catalogs/lakehouse/catalog-roles/read-role/grants" \
+    "{\"grant\": {\"type\": \"namespace\", \"namespace\": [\"ecommerce\"], \"privilege\": \"${priv}\"}}"
+done
+
+put "/principal-roles/writer/catalog-roles/lakehouse" '{"catalogRole": {"name": "write-role"}}'
+put "/principal-roles/reader/catalog-roles/lakehouse" '{"catalogRole": {"name": "read-role"}}'
+
+echo "Bootstrap complete."
