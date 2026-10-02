@@ -1,418 +1,429 @@
-# Postgres → Apache Fluss → Apache Iceberg, on SeaweedFS
+# Streaming lakehouse: Postgres → Apache Fluss → Apache Iceberg
 
-A working, end-to-end streaming lakehouse: [Apache Fluss](https://fluss.apache.org/)
-replaces Kafka + Debezium + Kafka Connect as the CDC middle tier, and
-[SeaweedFS](https://github.com/seaweedfs/seaweedfs) replaces MinIO as the
-object store underneath the lakehouse. Same e-commerce source schema and seed
-data as [`stream-debezium-kafka`](https://github.com/salbifaza/stream-debezium-kafka) and
-[`stream-cdc-peerdb`](https://github.com/salbifaza/stream-cdc-peerdb), so this is a genuine third data
-point in that comparison, not a different demo.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Fluss](https://img.shields.io/badge/Fluss-0.9.1-0B7285)
+![Flink](https://img.shields.io/badge/Flink-1.20_+_CDC_3.6-orange)
+![Iceberg](https://img.shields.io/badge/Iceberg-1.10.1-4C6EF5)
+![Polaris](https://img.shields.io/badge/Polaris-REST_catalog-6741D9)
+![SeaweedFS](https://img.shields.io/badge/SeaweedFS-S3-2F9E44)
+![Trino](https://img.shields.io/badge/Trino-483-DD00A1)
 
-**This is not a "Fluss vs. Kafka" writeup for its own sake.** It's a
-from-scratch build, verified end to end with `make verify`, of the specific
-claim Fluss makes about itself: that it can collapse a Kafka+Debezium+lakehouse
-pipeline into one system. It does — but five things had to be worked around
-or fixed to get there, and they're the most useful part of this repo.
+**Kafka, Debezium, Kafka Connect and a lake sink connector, replaced by one
+system. It works, after nine fixes.**
 
-## Contents
+[Apache Fluss](https://fluss.apache.org/) claims it can collapse the usual
+CDC stack into a single streaming storage layer that tiers itself into a
+lakehouse. I built that from scratch: Postgres changes stream into Fluss,
+Flink SQL maintains bronze, silver and gold layers continuously, and Fluss
+tiers every layer into Apache Iceberg on
+[SeaweedFS](https://github.com/seaweedfs/seaweedfs), where Trino queries it.
+There is no batch step anywhere.
 
-[Architecture](#architecture) ·
-[Streaming medallion](#streaming-medallion) ·
-[Quickstart](#quickstart) ·
-[What this proves](#what-this-actually-proves) ·
-[Findings — what broke and why](#findings--what-broke-and-why) ·
-[Comparison to stream-debezium-kafka](#comparison-to-stream-debezium-kafka) ·
-[Repo layout](#repo-layout) ·
-[Production considerations](#production-considerations)
+The claim holds. Getting there meant working around upstream bugs, missing
+jars and undocumented settings, and those nine findings are the most useful
+part of this repo.
+
+## Results at a glance
+
+| | |
+|---|---|
+| **End to end** | Postgres `INSERT` / `UPDATE` / `DELETE` → queryable in Iceberg via Trino in **~30–150 s** |
+| **Hot tier** | Postgres → Fluss is near-instant; Fluss primary-key tables support point lookups directly |
+| **Gold correctness** | All 3 gold tables **equal the same aggregates computed in Postgres**, before and after live changes |
+| **Retractions** | Cancelling and un-cancelling an order, renaming a category, inserting and deleting lines: gold converges back every time |
+| **Coverage** | **14 tables** (6 bronze, 5 silver, 3 gold) tiered into Iceberg; full medallion check runs in **44–100 s** |
+| **Open format** | Tiered output is plain Iceberg: Parquet data, Avro manifests, JSON metadata, read by Trino with zero Fluss-specific code |
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    PG[(Postgres 16<br/>logical replication)]
+
+    subgraph Hot["Hot tier: Fluss primary-key tables"]
+        B[bronze.*<br/>current state]
+        S[silver.*<br/>clean · conform · join]
+        G[gold.*<br/>retraction-safe aggregates]
+    end
+
+    subgraph Flink["Flink 1.20"]
+        CDC[Flink CDC pipeline<br/>public.* → bronze.*]
+        SJ[silver job<br/>Flink SQL]
+        GJ[gold job<br/>Flink SQL]
+        TIER[tiering service<br/>2 jobs]
+    end
+
+    subgraph Cold["Cold tier: Iceberg"]
+        POL[Polaris<br/>REST catalog]
+        SW[(SeaweedFS<br/>S3 storage)]
+    end
+
+    TR[Trino]
+
+    PG --> CDC --> B
+    B --> SJ --> S
+    S --> GJ --> G
+    B & S & G --> TIER
+    TIER -- Parquet + Avro + JSON --> SW
+    TIER -. commits .-> POL
+    TR --> POL
+    TR --> SW
 ```
-Postgres (source, logical replication)
-    │  Flink CDC (postgres-cdc pipeline connector, route public.* -> bronze.*)
-    ▼
-Fluss bronze.*  ──Flink SQL──▶  Fluss silver.*  ──Flink SQL──▶  Fluss gold.*
- (current state)    (clean / conform / join)      (retraction-safe aggregates)
-    │                         │                              │
-    └──────── Fluss datalake tiering service (2 Flink jobs) ─┘
-                              ▼
-     Iceberg namespaces bronze / silver / gold (Apache Polaris REST catalog)
-                              │  Parquet + Avro + JSON metadata
-                              ▼
-     SeaweedFS (S3-compatible object storage, replaces MinIO)
-                              ▼
-     Trino (query engine, reads Iceberg through Polaris)
-```
 
-Fluss is the hot tier (PK tables, replaces Kafka+Debezium+Kafka Connect) for
-every layer; Iceberg is the cold tier for every layer.
+Fluss is the hot tier for every layer and Iceberg is the cold tier for
+every layer. Each Fluss table is tiered into an Iceberg namespace of the
+same name.
 
-Services (`docker-compose.yml`):
-
-| Service | Role |
-|---|---|
-| `source-postgres` | CDC source, same schema/seed data as sibling repos |
-| `flink-jobmanager` / `flink-taskmanager` | Runs the CDC pipeline job, 2 tiering service jobs, and the silver + gold medallion jobs (8 slots, 6 used) |
-| `fluss-coordinator` / `fluss-tablet` | The Fluss cluster (hot tier) |
-| `zookeeper` | Fluss's metadata store (Fluss has no KRaft-equivalent yet) |
-| `seaweedfs` | S3-compatible object storage (`weed mini`: master+volume+filer+S3 gateway in one process) |
-| `polaris` / `polaris-postgres` | Iceberg REST catalog + its metastore |
-| `trino` | Query engine, reads Iceberg tables through Polaris |
-
-## Streaming medallion
-
-Bronze, silver, and gold are all continuously maintained -- there is no
-batch step anywhere. Each layer is a set of Fluss primary-key tables (hot,
-sub-second), tiered by the same tiering service into an Iceberg namespace of
-the same name (cold, queried by Trino).
-
-| Layer | Tables | Semantics | Built by |
+| Layer | Tables | What it holds | Built by |
 |---|---|---|---|
-| `bronze` | the 6 source tables | **Current state** of each Postgres table (UPDATE/DELETE applied), 1:1 with the source | The CDC job; a `route:` block in `flink/postgres-to-fluss.yaml` lands `public.*` in `bronze.*` |
-| `silver` | `customers`, `products`, `orders`, `order_lines`, `payments` | Trimmed / case-normalised text, `DECIMAL` money alongside integer cents, `order_date`, and `order_lines` = items joined with orders, products, categories | `flink/medallion/silver_job.sql` -- one Flink SQL job reading the bronze changelog |
-| `gold` | `daily_revenue_by_category`, `customer_lifetime_value`, `order_status_summary` | Business aggregates, excluding cancelled orders where relevant | `flink/medallion/gold_job.sql` -- one Flink SQL job reading the silver changelog |
+| `bronze` | the 6 source tables | Current state of each Postgres table, 1:1 | Flink CDC ([`postgres-to-fluss.yaml`](flink/postgres-to-fluss.yaml)) |
+| `silver` | `customers`, `products`, `orders`, `order_lines`, `payments` | Trimmed and normalised text, `DECIMAL` money next to integer cents, `order_lines` joined with orders, products and categories | [`silver_job.sql`](flink/medallion/silver_job.sql) |
+| `gold` | `daily_revenue_by_category`, `customer_lifetime_value`, `order_status_summary` | Business aggregates, excluding cancelled orders where relevant | [`gold_job.sql`](flink/medallion/gold_job.sql) |
 
-Design choices worth knowing:
+Three design choices:
 
-- **Silver uses regular streaming joins, not Fluss lookup joins.** A lookup
-  join is cheaper (no Flink state) but not retroactive: renaming a category
-  wouldn't update order lines already emitted, and during the initial
-  snapshot an order item that arrives before its product would be dropped
-  for good. A regular join re-emits whenever either side changes, so silver
-  stays an exact function of bronze.
-- **Gold is retraction-safe.** Fluss PK tables emit a full changelog
-  (`-U/+U/-D`), and `COUNT`, `SUM`, `COUNT(DISTINCT)`, `MIN`/`MAX` all
-  retract. Cancelling an order moves its revenue out of gold in place; a
-  group whose last row is retracted is deleted, matching Postgres's
+- **Regular streaming joins in silver, not lookup joins.** A lookup join is
+  cheaper but not retroactive: renaming a category wouldn't update order
+  lines already emitted, and an order item that arrives before its product
+  during the snapshot would be dropped for good. A regular join re-emits
+  when either side changes, so silver stays an exact function of bronze.
+- **Gold is retraction-safe.** Fluss primary-key tables emit a full
+  changelog (`-U/+U/-D`), and `COUNT`, `SUM`, `COUNT(DISTINCT)` and
+  `MIN`/`MAX` all retract. A cancelled order's revenue leaves gold in place,
+  and a group whose last row is retracted is deleted, matching Postgres's
   `GROUP BY`.
 - **Money is kept in integer cents** next to the `DECIMAL` columns, so gold
-  can be reconciled exactly against Postgres (`make verify-medallion`).
+  reconciles exactly against Postgres.
 
-## Quickstart
+## Run it
+
+Requires Docker Compose v2 with enough memory for a 4 GB Flink
+TaskManager plus the other services.
 
 ```bash
-make up                # starts storage/catalog/Fluss/Flink/Trino
-# wait ~30s for polaris-bootstrap and fluss-coordinator to settle
-make submit-pipeline   # submits the Postgres -> Fluss CDC job
-make submit-tiering    # submits 2 Fluss -> Iceberg tiering jobs (TIERING_JOBS=2)
-make submit-medallion  # waits for bronze, then submits bronze->silver and silver->gold
-make verify            # bronze: row-count check + live insert/update/delete test
+make smoke   # up, submit all jobs with built-in waits, then verify bronze and gold
+```
+
+Or step by step:
+
+```bash
+make up                # SeaweedFS, Polaris, Fluss, Flink, Trino, Postgres
+make submit-pipeline   # Postgres -> Fluss CDC job
+make submit-tiering    # 2 Fluss -> Iceberg tiering jobs (TIERING_JOBS=2)
+make submit-medallion  # bronze -> silver and silver -> gold jobs (guarded against duplicates)
+make verify            # bronze: row counts + live insert/update/delete through to Iceberg
 make verify-medallion  # gold reconciled against Postgres + live retraction test
 ```
 
-Or `make smoke` to do all of the above with built-in waits.
+The gold check, trimmed:
 
-**Upgrading an existing stack**: run `make reset` and
-`docker compose build flink-jobmanager flink-taskmanager` first. `make up`
-reuses a cached Flink image, and the old `public.*` tables and CDC slot
-offsets don't carry over to `bronze.*`.
+```
+== Step 1: layers exist in Iceberg (via Trino) ==
+  all 14 tables present
 
-UIs: Flink `:8082`, Trino `:8080`, Polaris `:8181`, SeaweedFS S3 `:8333`
-(Admin UI `:23646`).
+== Step 2: gold reconciles with Postgres ==
+  daily_revenue_by_category    OK
+  customer_lifetime_value      OK
+  order_status_summary         OK
 
-## What this actually proves
+== Step 3: live mutations -> gold converges again ==
+  toggling order_id=5 between 'paid' and 'cancelled'...
+  toggling a ' (renamed)' suffix on category_id=3...
+  inserting a new order with 2 lines, then deleting one line...
+  daily_revenue_by_category    OK
+  customer_lifetime_value      OK
+  order_status_summary         OK
 
-Everything below was reproduced against this repo's own running stack via
-`scripts/verify_pipeline.sh`:
+Medallion verification PASSED.
+```
 
-- **Initial snapshot**: all 6 tables, exact row-count match between Postgres
-  and Iceberg (queried through Trino) after the CDC pipeline's snapshot phase.
-- **Live CDC + tiering**: an INSERT, UPDATE, and DELETE against
-  `source-postgres` each land in Iceberg (visible via Trino) within about
-  30–150 seconds — Postgres → Fluss is near-instant; Fluss → Iceberg is
-  bounded by the tiering service's per-table freshness target (30s) times up
-  to 6 tables, since one tiering job round-robins across all tables rather
-  than tiering them in parallel.
-- **Fluss's Iceberg tiering produces standard Iceberg tables**: verified by
-  reading the raw S3 objects directly (`mc ls` against SeaweedFS shows
-  Parquet data files, Avro manifests, and JSON metadata files — the same
-  layout `lakehouse-iceberg-batch` produces via dlt) and by querying them
-  from Trino, an engine with zero Fluss-specific code.
-- **Two genuine upstream bugs (in Flink CDC's transform module and its
-  schema-type-inference code) found and worked around**, not glossed over —
-  see [Findings](#findings--what-broke-and-why).
-- **Streaming medallion, reconciled exactly against the source**
-  (`make verify-medallion`): all 14 tables (6 bronze, 5 silver, 3 gold)
-  land in their Iceberg namespaces; every gold table equals the same
-  aggregation computed directly on Postgres; and after a live order
-  cancel/un-cancel, a category rename, an INSERT, and a DELETE, gold
-  converges back to Postgres through bronze -> silver -> gold -> Iceberg in
-  well under the 480s timeout (whole script: 44-100s with 2 tiering jobs).
+| UI | URL |
+|---|---|
+| Flink dashboard | http://localhost:8082 |
+| Trino | http://localhost:8080 |
+| Polaris REST catalog | http://localhost:8181 |
+| SeaweedFS S3 / admin | http://localhost:8333 · http://localhost:23646 |
 
-## Findings — what broke and why
+`make status` shows Flink job states. `make down` stops the stack and keeps
+data, and `make reset` wipes it.
 
-Findings 1-5 had to be fixed before the CDC pipeline worked, and 6-9
-before the [medallion](#streaming-medallion) did, in the order they
-were hit. Each is a real, reproducible finding against the specific version
-combination used here (Fluss 0.9.1-incubating, Flink CDC 3.6.0, Flink 1.20,
-Iceberg 1.10.1), not a design preference.
+## Nine things that broke
 
-### 1. Fluss doesn't support `TIMESTAMP WITH TIME ZONE`, and the documented workaround doesn't work either
+Tested against Fluss 0.9.1-incubating, Flink CDC 3.6.0, Flink 1.20 and
+Iceberg 1.10.1. Findings 1–5 blocked the CDC pipeline, and 6–9 blocked the
+medallion, in the order I hit them. Expand any row for the full story.
 
-Postgres's `TIMESTAMPTZ` maps to Flink CDC's `ZonedTimestampType`. The Fluss
-sink connector rejects it outright:
-`Unsupported data type in fluss TIMESTAMP(6) WITH TIME ZONE`.
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 1 | Fluss sink rejects `TIMESTAMPTZ`; the `CAST` workaround crashes too | Unsupported type in Fluss, plus a separate Flink CDC transform bug | Plain `TIMESTAMP` in the source schema |
+| 2 | `ClassNotFoundException`, then `Missing S3FileIO` | Fluss image ships none of the S3/Iceberg jars; `iceberg-aws-bundle` doesn't contain `S3FileIO` | Add 4 jars to Fluss and Flink; set `io-impl` explicitly |
+| 3 | Snapshot loads, then live changes **silently never arrive** | Flink CDC only switches to streaming after a checkpoint, and none was configured | `execution.checkpointing.interval=10s` |
+| 4 | First `UPDATE` or `DELETE` crash-loops the whole job | Flink CDC NPE on the null columns `REPLICA IDENTITY DEFAULT` sends | `REPLICA IDENTITY FULL` on every table |
+| 5 | Fluss starts with empty credentials and never recovers | Compose snapshots `env_file` before the bootstrap writes it | Entrypoint wrapper reads creds at every start |
+| 6 | One `DATE` column **stops tiering for every table** | Fluss's Iceberg writer passes a date object, not an int; tiering has no restart | ISO date `STRING` |
+| 7 | `CREATE TABLE` fails on a composite primary key | Iceberg integration supports only one bucket key | `'bucket.key' = 'category_id'` |
+| 8 | `CREATE TABLE IF NOT EXISTS` fails on re-run | Fails once the Iceberg twin exists; `DROP ... CASCADE` orphans Iceberg tables | Split DDL from jobs; create a layer only when it's absent |
+| 9 | Submit script reports success with no job running | `sql-client.sh -f` exits 0 on `[ERROR]` (here: reserved word `method`) | Grep output for `[ERROR]`; backtick `method` |
 
-The obvious fix — `CAST(col AS TIMESTAMP)` in a `transform` rule — doesn't
-work either. It hits a **separate, confirmed upstream bug** in Flink CDC
-3.6.0's transform module: a `NumberFormatException` in
-`BinaryRecordData.getZonedTimestamp`, thrown while `PreTransformOperator` is
-filling in the row's *other* fields, before the cast expression itself ever
-runs. (Same underlying issue independently reported against a different sink
-in [flink-cdc#4163](https://github.com/apache/flink-cdc/discussions/4163).)
+<details>
+<summary><b>1. Fluss doesn't support <code>TIMESTAMP WITH TIME ZONE</code>, and the obvious workaround crashes</b></summary>
 
-**Fix applied**: `postgres/init/01_schema.sql` uses plain `TIMESTAMP` columns,
-not `TIMESTAMPTZ`, avoiding the type entirely rather than working around a
-broken code path. Worth re-testing on a newer Flink CDC release.
+Postgres's `TIMESTAMPTZ` maps to Flink CDC's `ZonedTimestampType`, which
+the Fluss sink rejects: `Unsupported data type in fluss TIMESTAMP(6) WITH
+TIME ZONE`.
 
-### 2. Neither Fluss's CoordinatorServer nor the tiering service ship the jars they need for S3-backed Iceberg
+`CAST(col AS TIMESTAMP)` in a `transform` rule hits a separate upstream bug
+in Flink CDC 3.6.0's transform module: a `NumberFormatException` in
+`BinaryRecordData.getZonedTimestamp`, thrown while `PreTransformOperator`
+fills in the row's *other* fields, before the cast runs. The same issue is
+reported against a different sink in
+[flink-cdc#4163](https://github.com/apache/flink-cdc/discussions/4163).
 
-`apache/fluss:0.9.1-incubating`'s image bundles `fluss-lake-iceberg` (the
-connector glue) but nothing else. Two separate missing-jar failures, in order:
+**Fix:** [`postgres/init/01_schema.sql`](postgres/init/01_schema.sql) uses
+plain `TIMESTAMP` columns. Worth re-testing on a newer Flink CDC release.
 
-- `ClassNotFoundException: org.apache.hadoop.conf.Configurable` — Iceberg's
-  `CatalogUtil.loadFileIO` classloading path touches Hadoop's `Configurable`
-  class even when the actual FileIO implementation used is S3-based, not
-  Hadoop-based. Needs a Hadoop jar on the classpath regardless.
-- `Cannot find constructor for interface org.apache.iceberg.io.FileIO ...
-  Missing org.apache.iceberg.aws.s3.S3FileIO` — **`iceberg-aws-bundle`,
-  despite the name, does not contain `S3FileIO`.** It's just the shaded AWS
-  SDK dependencies `S3FileIO` needs at runtime. The class itself lives in
-  the separate `iceberg-aws` jar. Confirmed by inspecting the bundle jar:
-  zero `S3FileIO` class entries anywhere in it.
+</details>
 
-**Fix applied**: `fluss/Dockerfile` adds `iceberg-aws`, `iceberg-aws-bundle`,
-`hadoop-apache`, and `failsafe` to `${FLUSS_HOME}/plugins/iceberg/` — needed
-by the CoordinatorServer/TabletServer themselves (they open an Iceberg
-catalog client directly, not just the separate Flink tiering job). The same
-four jars are duplicated into `${FLINK_HOME}/lib` in `flink/Dockerfile` for
-the tiering service, per Fluss's own docs.
+<details>
+<summary><b>2. Neither Fluss nor the tiering service ships the jars for S3-backed Iceberg</b></summary>
 
-Related: even with the right jars, Iceberg's `ResolvingFileIO` falls back to
-`HadoopFileIO` for `s3://` paths unless told otherwise, which throws a
-misleading `No FileSystem for scheme s3` (Hadoop's `S3AFileSystem` isn't on
-the classpath by design here). Fixed by setting
-`datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO` explicitly —
-undocumented in Fluss's own Iceberg integration page, found by reading the
-actual exception's `DynConstructors` call chain.
+`apache/fluss:0.9.1-incubating` bundles `fluss-lake-iceberg` and nothing
+else. Two failures, in order:
 
-### 3. Flink CDC needs an explicit checkpoint interval, or streaming silently never starts
+- `ClassNotFoundException: org.apache.hadoop.conf.Configurable`. Iceberg's
+  `CatalogUtil.loadFileIO` touches Hadoop's `Configurable` even when the
+  FileIO is S3-based.
+- `Missing org.apache.iceberg.aws.s3.S3FileIO`. **`iceberg-aws-bundle`,
+  despite the name, does not contain `S3FileIO`.** It holds only the shaded
+  AWS SDK. The class lives in the separate `iceberg-aws` jar. Inspecting
+  the bundle jar showed zero `S3FileIO` entries.
 
-Flink CDC's incremental snapshot framework
-(`SnapshotSplitAssigner`) only transitions the Postgres source from
-snapshot phase to streaming phase **after a checkpoint completes** following
-the last snapshot chunk. Flink CDC 3.5+ removed the checkpointing defaults
-that older docs assumed — Flink's own `flink-conf.yaml` in this image has no
-checkpoint interval configured by default.
+**Fix:** [`fluss/Dockerfile`](fluss/Dockerfile) adds `iceberg-aws`,
+`iceberg-aws-bundle`, `hadoop-apache` and `failsafe` to
+`${FLUSS_HOME}/plugins/iceberg/`. The coordinator and tablet servers open
+an Iceberg catalog client themselves, not just the tiering job. The same
+four jars go into `${FLINK_HOME}/lib` in [`flink/Dockerfile`](flink/Dockerfile).
 
-**Symptom**: the job logs
-`Snapshot split assigner received all splits finished, waiting for a
-complete checkpoint to mark the assigner finished` and then just... sits
-there. Snapshot data flows fine. Live inserts after that point are silently
-never picked up — no error, no warning, job stays `RUNNING`. Confirmed by
-testing: an INSERT made after the pipeline started never reached Fluss until
-this was fixed.
+Even with the jars, Iceberg's `ResolvingFileIO` falls back to `HadoopFileIO`
+for `s3://` paths and throws a misleading `No FileSystem for scheme s3`.
+Setting `datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO`
+fixes it. That setting isn't on Fluss's Iceberg page; I found it by reading
+the exception's `DynConstructors` call chain.
 
-**Fix applied**: `flink/run-cdc-pipeline.sh` passes
-`-D execution.checkpointing.interval=10s` to `flink-cdc.sh`.
+</details>
 
-### 4. Postgres's default `REPLICA IDENTITY` crash-loops the whole pipeline on the first UPDATE or DELETE
+<details>
+<summary><b>3. Without a checkpoint interval, streaming silently never starts</b></summary>
 
-With Postgres's default `REPLICA IDENTITY DEFAULT`, UPDATE/DELETE WAL records
-only carry the **primary key** in the "before" image — every other column
-comes through as `NULL`. Flink CDC 3.6.0's schema-type-inference code
-(`DebeziumSchemaDataTypeInference.inferStruct`) throws a bare
-`NullPointerException` when it tries to infer a type from those null,
-non-PK fields. This isn't a graceful degradation — it **crash-loops the
-entire Flink job** (all 4 pipeline tasks restart, repeatedly, on every
-checkpoint-restore attempt) the instant any UPDATE or DELETE hits a table
-with the default replica identity.
+Flink CDC's `SnapshotSplitAssigner` only moves the Postgres source from
+snapshot to streaming **after a checkpoint completes** following the last
+snapshot chunk. Flink CDC 3.5+ removed the checkpointing defaults older
+docs assume, and this image's Flink config has none.
 
-**Fix applied**: `postgres/init/01_schema.sql` sets
-`ALTER TABLE ... REPLICA IDENTITY FULL` on every captured table. This is
-also good practice for the sibling Debezium-based repos, which need it for
-the same reason (full old-row detail on UPDATE/DELETE), even though Debezium
-itself doesn't crash without it.
+The job logs `Snapshot split assigner received all splits finished, waiting
+for a complete checkpoint to mark the assigner finished` and then sits
+there. Snapshot data arrives, but every later insert is silently ignored:
+no error, no warning, job still `RUNNING`.
 
-### 5. Compose creates containers (baking in `env_file`) before their dependency's output actually exists
+**Fix:** [`flink/run-cdc-pipeline.sh`](flink/run-cdc-pipeline.sh) passes
+`-D execution.checkpointing.interval=10s`.
 
-`fluss-coordinator`/`fluss-tablet` need `FLUSS_CLIENT_ID`/`FLUSS_CLIENT_SECRET`,
-generated by `polaris-bootstrap` at runtime into `polaris/creds.env`. The
-natural approach — `env_file: ./polaris/creds.env` plus
-`depends_on: polaris-bootstrap: condition: service_completed_successfully`
-— looks correct but isn't reliable: Compose **creates** a container (which
-snapshots `env_file`'s contents at that moment) as soon as dependency
-conditions are satisfied, but on a cold `docker compose up`, was observed
-creating `fluss-coordinator` a full 60 seconds *before* `polaris-bootstrap`
-actually finished writing real values into `creds.env`. The coordinator then
-started with empty credentials baked in — and because `restart:
-unless-stopped` restarts the *same* container rather than recreating it, it
-kept retrying with permanently empty values (`NotAuthorizedException:
-invalid_client`) until manually recreated.
+</details>
 
-**Fix applied**: `fluss/docker-entrypoint-wrapper.sh` sources
-`/polaris/creds.env` itself, every container start (initial start *and*
-every subsequent restart), before handing off to the base image's own
-`/docker-entrypoint.sh`. `docker-compose.yml` mounts `creds.env` as a
-read-only volume instead of `env_file`, so the wrapper always reads current
-contents at the moment it actually runs, not whatever existed at container
-creation.
+<details>
+<summary><b>4. The default <code>REPLICA IDENTITY</code> crash-loops the pipeline on the first UPDATE</b></summary>
 
-### 6. Fluss's Iceberg tiering can't write `DATE` columns, and one bad table stops tiering for all of them
+With `REPLICA IDENTITY DEFAULT`, UPDATE and DELETE WAL records carry only
+the primary key in the before-image, and every other column is `NULL`.
+Flink CDC 3.6.0's `DebeziumSchemaDataTypeInference.inferStruct` throws a
+bare `NullPointerException` on those fields. All 4 pipeline tasks restart,
+repeatedly, on every checkpoint restore, from the first UPDATE or DELETE
+onward.
 
-A silver table with a `DATE` column (`order_date`) was created fine and the
-silver job wrote to it fine, but both tiering jobs then failed with
-`Failed to write Fluss record to Iceberg` /
-`IllegalStateException: Not an instance of java.lang.Integer: 2026-09-07`.
-Fluss 0.9.1's Iceberg writer hands Iceberg a date object, while Iceberg's
-`DATE` internally expects an int day count. The tiering jobs run with
-`NoRestartBackoffTimeStrategy`, so the job goes to `FAILED` and **every**
-table stops tiering, bronze included. That surfaced first as a bronze
-UPDATE that never reached Trino, not as anything date-related.
+**Fix:** `ALTER TABLE ... REPLICA IDENTITY FULL` on every captured table in
+[`postgres/init/01_schema.sql`](postgres/init/01_schema.sql).
 
-**Fix applied**: `order_date` is `STRING` (`DATE_FORMAT(created_at,
-'yyyy-MM-dd')`) in `silver_tables.sql` and `gold_tables.sql`. ISO date
-strings still sort and compare correctly. `DECIMAL` columns tier fine.
+</details>
 
-### 7. Composite primary keys need an explicit single `bucket.key` for Iceberg
+<details>
+<summary><b>5. Compose bakes in <code>env_file</code> before the file has real contents</b></summary>
+
+The Fluss servers need `FLUSS_CLIENT_ID`/`FLUSS_CLIENT_SECRET`, which
+`polaris-bootstrap` writes to `polaris/creds.env` at runtime. `env_file` plus
+`depends_on: condition: service_completed_successfully` looks right but
+isn't. On a cold start, Compose created `fluss-coordinator`, snapshotting
+`env_file`, 60 seconds before `polaris-bootstrap` finished writing. The
+coordinator got empty credentials, and because `restart: unless-stopped`
+restarts the *same* container, it retried forever with
+`NotAuthorizedException: invalid_client`.
+
+**Fix:** [`fluss/docker-entrypoint-wrapper.sh`](fluss/docker-entrypoint-wrapper.sh)
+sources `/polaris/creds.env` on every start, then hands off to the image's
+entrypoint. The file is mounted read-only instead of used as `env_file`.
+
+A related detail: `FLUSS_PROPERTIES` references `$FLUSS_CLIENT_ID`, which the
+Fluss image resolves with `envsubst`. In `docker-compose.yml` it's escaped
+as `$$FLUSS_CLIENT_ID`, so Compose doesn't substitute an empty value first.
+
+</details>
+
+<details>
+<summary><b>6. One <code>DATE</code> column stops tiering for every table</b></summary>
+
+A silver table with a `DATE` column was created and written fine, but both
+tiering jobs then failed: `IllegalStateException: Not an instance of
+java.lang.Integer: 2026-09-07`. Fluss 0.9.1's Iceberg writer passes a date
+object where Iceberg expects an int day count. Tiering jobs run with
+`NoRestartBackoffTimeStrategy`, so the job goes `FAILED` and **every**
+table stops tiering. It first showed up as a bronze UPDATE that never
+reached Trino, nothing obviously date-related.
+
+**Fix:** `order_date` is an ISO `STRING` (`DATE_FORMAT(created_at,
+'yyyy-MM-dd')`), which still sorts and compares correctly. `DECIMAL`
+columns tier fine.
+
+</details>
+
+<details>
+<summary><b>7. Composite primary keys need a single <code>bucket.key</code> for Iceberg</b></summary>
 
 `gold.daily_revenue_by_category` has `PRIMARY KEY (order_date, category_id)`.
-A Fluss PK table's bucket key defaults to the whole primary key, and the
-Iceberg lake integration rejects that at `CREATE TABLE`:
-`UnsupportedOperationException: Only one bucket key is supported for Iceberg
-at the moment`.
+The bucket key defaults to the whole primary key, which the Iceberg
+integration rejects: `UnsupportedOperationException: Only one bucket key is
+supported for Iceberg at the moment`.
 
-**Fix applied**: `'bucket.key' = 'category_id'` in the table's `WITH`
-clause.
+**Fix:** `'bucket.key' = 'category_id'` in the table's `WITH` clause.
 
-### 8. `CREATE TABLE IF NOT EXISTS` isn't re-runnable for datalake-enabled tables
+</details>
 
-Once a `table.datalake.enabled` table's Iceberg counterpart exists,
-`CREATE TABLE IF NOT EXISTS` fails with `CatalogException: Table
-silver.customers already exists`, even when the Fluss table also exists
-(the same statement without `table.datalake.enabled` succeeds as a no-op).
-Separately, `DROP DATABASE ... CASCADE` in the Fluss catalog drops the
-Fluss tables but **leaves their Iceberg tables in Polaris**, so a
-drop-and-recreate fails the same way. The orphans have to be deleted
-through Polaris's REST API with the writer (`fluss_tiering`) principal,
-because Trino's `analyst` principal is read-only.
+<details>
+<summary><b>8. <code>CREATE TABLE IF NOT EXISTS</code> isn't re-runnable for lake-enabled tables</b></summary>
 
-**Fix applied**: DDL is split from the jobs (`*_tables.sql` vs
-`*_job.sql`). `run-medallion.sh` creates a layer's tables only when none of
-them exist, skips creation when all exist, and refuses to guess on a
+Once a `table.datalake.enabled` table's Iceberg twin exists, `CREATE TABLE
+IF NOT EXISTS` fails with `CatalogException: Table silver.customers already
+exists`, even though the Fluss table exists too. `DROP DATABASE ...
+CASCADE` drops the Fluss tables but **leaves their Iceberg tables in
+Polaris**, so drop-and-recreate fails the same way. The orphans have to be
+deleted through Polaris's REST API as the writer principal, because Trino's
+principal is read-only.
+
+**Fix:** DDL is split from the jobs (`*_tables.sql` vs `*_job.sql`).
+[`run-medallion.sh`](flink/run-medallion.sh) creates a layer's tables only
+when none exist, skips creation when all exist, and refuses to guess on a
 partial layer.
 
-### 9. `sql-client.sh -f` exits 0 when a statement fails
+</details>
+
+<details>
+<summary><b>9. <code>sql-client.sh -f</code> exits 0 when a statement fails</b></summary>
 
 A failed statement prints `[ERROR]` and stops the file, but the process
-exits 0, so a naive submit script reports success with no job running.
-This hid the first silver failure, which was itself caused by `method` (a
-`payments` column) being a reserved word in Flink SQL. It needs backticks.
+exits 0, so the submit script reported success with no job running. It hid
+the first silver failure, caused by `method` (a `payments` column) being a
+reserved word in Flink SQL.
 
-**Fix applied**: `run-medallion.sh` greps the client's output for `[ERROR]`
-and fails loudly. `method` is quoted in `silver_*.sql`.
+**Fix:** `run-medallion.sh` greps the client output for `[ERROR]` and fails
+loudly, and `method` is backtick-quoted.
 
-### Also worth knowing (not bugs, just friction)
+</details>
 
-- **Docker named volumes are root-owned by default.** `apache/fluss`'s image
-  runs as uid 9999; a fresh named volume mounted into it is owned by root,
-  so the tablet server crash-loops on `Permission denied` writing its
-  recovery checkpoint. Fixed with a `fluss-tablet-data-init` one-shot
-  `chown` container ahead of the tablet server, same pattern
-  `lakehouse-iceberg-batch` uses for `polaris-creds-init`.
-- **`docker-compose.yml`'s `$$` escaping for Fluss's own `envsubst`.**
-  Separately from finding 5 above, the `FLUSS_PROPERTIES` block itself
-  references `$FLUSS_CLIENT_ID`/`$FLUSS_CLIENT_SECRET` (for
-  `datalake.iceberg.credential`), which the Fluss image's own
-  `docker-entrypoint.sh` resolves via `envsubst` over `server.yaml` at
-  container start. Those had to be escaped as `$$FLUSS_CLIENT_ID` in
-  `docker-compose.yml` so Compose leaves the literal `$FLUSS_CLIENT_ID`
-  string alone at parse time instead of substituting an empty value itself.
-- **SeaweedFS's STS/AssumeRole was never actually exercised.** Going in, the
-  concern was that Polaris's credential-vending (STS AssumeRole against
-  SeaweedFS) might hit the same instability flagged in
+<details>
+<summary><b>Smaller friction</b></summary>
+
+- **Root-owned volumes.** The Fluss image runs as uid 9999, so a fresh named
+  volume made the tablet server crash-loop on `Permission denied`. A
+  one-shot `fluss-tablet-data-init` container `chown`s it first.
+- **SeaweedFS STS was never exercised.** I expected Polaris's credential
+  vending to hit the instability in
   [seaweedfs#8312](https://github.com/seaweedfs/seaweedfs/discussions/8312).
-  In practice, this pipeline authenticates to SeaweedFS with static
-  credentials throughout (`s3.access-key`/`s3.secret-key` for Fluss and
-  Polaris; Trino's `iceberg.rest-catalog.vended-credentials-enabled=true`
-  does request vended credentials from *Polaris*, but Polaris's own S3 calls
-  to SeaweedFS use static keys, not STS). The STS risk never actually came
-  up — worth flagging as an open question for anyone who *does* need
-  SeaweedFS's STS path (e.g. scoped, short-lived credentials per query
-  engine), since that code path is genuinely less mature.
+  In practice Fluss and Polaris use static keys against SeaweedFS. Trino
+  requests vended credentials from Polaris, but Polaris's own S3 calls stay
+  static. It's an open question for anyone who needs scoped, short-lived
+  credentials on SeaweedFS.
 
-## Comparison to `stream-debezium-kafka`
+</details>
 
-| | `stream-debezium-kafka` | This repo |
+## Why Fluss instead of Kafka + Debezium?
+
+| | Kafka + Debezium + Connect | Fluss (this repo) |
 |---|---|---|
-| CDC capture | Debezium (Kafka Connect source connector) | Flink CDC's built-in `postgres-cdc` pipeline connector |
-| Transport/storage | Kafka topics (JSON, schema in payload) | Fluss log + PK tables (columnar, Arrow-based) |
-| Sink wiring | Separate Kafka Connect sink connector (ClickHouse) | Fluss's datalake tiering is a first-class Fluss feature, not a bolt-on connector |
-| Containers running | 5 (Kafka, Kafka Connect, kafka-ui, source, destination) | 10 (source, ZK, 2x Fluss, 2x Flink, SeaweedFS, Polaris + its Postgres, Trino) — more, because this repo also stands up the full lakehouse (Iceberg/Polaris/Trino/SeaweedFS) that Kafka would otherwise hand off to a separate downstream system |
-| Point lookups on captured data | None (would need a separate KV store, e.g. Redis) | Native: `SELECT * FROM orders WHERE order_id = 1` against Fluss directly, sub-millisecond |
-| Historical/cold data | External (ClickHouse, unbounded retention by default) | Native tiering to Iceberg, standard Parquet/Avro, queryable by any Iceberg-compatible engine |
-| Schema evolution | Debezium's `auto.evolve` (opt-in, needs a ClickHouse grant, tested both ways — see that repo's `docs/architecture.md`) | Flink CDC's `schema-change.enabled` + Fluss's lenient schema evolution (add/drop/rename column) |
-| Maturity | Debezium: 8+ years, huge community | Fluss: graduated to ASF Top-Level Project Aug 2026 — 4 real upstream bugs found in one afternoon of use, plus 3 more Fluss/Iceberg integration gaps (findings 6-8) once a medallion was built on it |
+| **CDC capture** | Debezium source connector | Flink CDC's built-in `postgres-cdc` connector |
+| **Storage format** | Row-based topics (often JSON) | Columnar log + primary-key tables (Arrow-based) |
+| **Current state / point lookups** | Needs a separate store | Native primary-key tables |
+| **Lakehouse sink** | A separate sink connector to run | Tiering is built into Fluss |
+| **Cold data** | Wherever the sink writes | Standard Iceberg, readable by any Iceberg engine |
+| **Maturity** | Years of production use, large community | Young: 9 findings in this build alone |
 
-**The honest summary**: Fluss's core promise — collapsing Kafka + Debezium +
-Kafka Connect + a lakehouse-sink connector into one system with native PK
-lookups — genuinely holds up once configured correctly. But "configured
-correctly" required finding and working around two real Flink CDC 3.6.0 bugs
-and two missing/misdocumented dependency issues that aren't in Fluss's own
-docs. Debezium's ecosystem has had a decade to sand those edges off; Fluss's
-integration with Flink CDC's newer pipeline-connector framework clearly
-hasn't yet, at least not for Postgres.
+**Verdict:** the core promise holds. One system gives you a changelog, a
+queryable current state and a self-maintaining Iceberg copy. The price
+today is integration edges that the Kafka ecosystem smoothed off long ago,
+especially between Fluss and Flink CDC's newer pipeline framework for
+Postgres. I'd pick it for a new streaming lakehouse where the team can
+absorb that, and pin versions carefully.
 
-## Repo layout
+## What I'd change for production
+
+| Gap | Risk | What I'd do |
+|---|---|---|
+| One table can stop all tiering (finding 6) | Every layer silently stops reaching Iceberg | Alert on tiering job state; add a restart strategy |
+| No HA | Single JobManager, Fluss coordinator, tablet server and ZooKeeper | HA Flink, multiple Fluss servers, a ZooKeeper ensemble |
+| `weed mini` SeaweedFS | Single process, no replication | Separate master, volume and filer with replication |
+| Static S3 credentials | Broad, long-lived keys | Scoped STS vending once SeaweedFS's STS matures |
+| Tiering freshness (30 s per table, queued) | Lag grows with table count and throughput | Tune `table.datalake.freshness` and `TIERING_JOBS` |
+| Unbounded join and aggregate state | Heap state grows forever | RocksDB + `table.exec.state.ttl`, or lookup joins where staleness is fine |
+| Schema changes stop at bronze | Dropping a column silver reads fails the silver job | Versioned silver/gold DDL with a migration runbook |
+| No monitoring or CI | Failures found by hand | Fluss's Prometheus/Grafana quickstart; run `make smoke` in CI |
+
+## Under the hood
+
+<details>
+<summary><b>Services</b></summary>
+
+| Service | Role |
+|---|---|
+| `source-postgres` | CDC source |
+| `flink-jobmanager` / `flink-taskmanager` | CDC pipeline, 2 tiering jobs, silver and gold jobs (8 slots, 6 used, 4 GB) |
+| `fluss-coordinator` / `fluss-tablet` | The Fluss cluster (hot tier) |
+| `zookeeper` | Fluss's metadata store (Fluss has no KRaft equivalent yet) |
+| `seaweedfs` | S3-compatible storage (`weed mini`: master, volume, filer and S3 gateway in one process) |
+| `polaris` / `polaris-postgres` | Iceberg REST catalog and its metastore |
+| `trino` | Query engine, reads Iceberg through Polaris |
+
+</details>
+
+<details>
+<summary><b>Upgrading an existing stack</b></summary>
+
+Run `make reset` and `docker compose build flink-jobmanager
+flink-taskmanager` first. `make up` reuses a cached Flink image, and old
+`public.*` tables and CDC slot offsets don't carry over to `bronze.*`.
+
+</details>
+
+<details>
+<summary><b>Repo layout</b></summary>
 
 ```
 docker-compose.yml                  All services
-fluss/Dockerfile                    apache/fluss + the missing Iceberg/S3/Hadoop jars
-fluss/docker-entrypoint-wrapper.sh  Sources polaris/creds.env at container start (finding 5)
+fluss/Dockerfile                    apache/fluss + the missing Iceberg/S3/Hadoop jars (finding 2)
+fluss/docker-entrypoint-wrapper.sh  Reads polaris/creds.env at every start (finding 5)
 flink/Dockerfile                    Flink 1.20 + Flink CDC + Fluss connectors + tiering jars
-flink/postgres-to-fluss.yaml        The CDC pipeline definition
-flink/run-cdc-pipeline.sh           Renders env vars into the pipeline YAML and submits it
-flink/run-tiering-service.sh        Submits one Fluss -> Iceberg tiering service job (instance # arg)
-flink/medallion/init.sql            Fluss catalog + streaming settings shared by the medallion jobs
-flink/medallion/*_tables.sql        Silver / gold Fluss table DDL (datalake-enabled)
-flink/medallion/*_job.sql           bronze -> silver and silver -> gold streaming jobs
+flink/postgres-to-fluss.yaml        CDC pipeline definition (public.* -> bronze.*)
+flink/run-cdc-pipeline.sh           Renders env vars into the pipeline and submits it
+flink/run-tiering-service.sh        Submits one Fluss -> Iceberg tiering job
 flink/run-medallion.sh              Waits for bronze, creates missing layers, submits both jobs
-polaris/bootstrap.sh                Creates the Polaris catalog, namespace, principals, grants
-postgres/init/                      Source schema (REPLICA IDENTITY FULL, plain TIMESTAMP) + seed data
+flink/medallion/init.sql            Fluss catalog + streaming settings
+flink/medallion/*_tables.sql        Silver / gold table DDL (lake-enabled)
+flink/medallion/*_job.sql           bronze -> silver and silver -> gold jobs
+polaris/bootstrap.sh                Polaris catalog, namespaces, principals, grants
+postgres/init/                      Source schema (REPLICA IDENTITY FULL, plain TIMESTAMP) + seed
 trino/etc/                          Trino config, including the Iceberg/Polaris catalog
-scripts/verify_pipeline.sh          Bronze: row-count + live CDC/tiering verification
+scripts/verify_pipeline.sh          Bronze: row counts + live CDC through to Iceberg
 scripts/verify_medallion.sh         Gold reconciled against Postgres + live retraction test
 ```
 
-## Production considerations
+</details>
 
-Named honestly, not glossed over:
+## License
 
-- **`weed mini` is a single-node, all-in-one SeaweedFS instance.** Fine for
-  this repo's purpose; production SeaweedFS wants separate master/volume/
-  filer processes with replication, per SeaweedFS's own docs.
-- **No HA for Flink or Fluss.** Single JobManager, single Fluss
-  CoordinatorServer, one TabletServer, one ZooKeeper node — all single
-  points of failure by design here, same "POC not production" framing as
-  `lakehouse-iceberg-batch`.
-- **Static S3 credentials throughout**, not the scoped STS credential-vending
-  pattern `lakehouse-iceberg-batch` uses for Trino/Polaris/MinIO. Revisit if
-  SeaweedFS's STS implementation matures (see the finding above).
-- **Tiering freshness (30s per table, queued) won't scale to many
-  tables or high-throughput tables without tuning** — `table.datalake.freshness`
-  and the number of tiering service instances (`TIERING_JOBS`, 2 here for the
-  medallion's 14 tables) are the levers to pull.
-- **One bad table stops tiering for every table.** The tiering jobs run with
-  no restart strategy, and a single table that fails to write (see the
-  `DATE` finding) fails the whole job, so bronze stops reaching Iceberg too.
-  Worth alerting on tiering job state.
-- **Medallion join and aggregate state is unbounded** (no
-  `table.exec.state.ttl`, heap state backend). Fine for this dataset; real
-  volumes want RocksDB plus a TTL, or lookup joins where staleness is
-  acceptable.
-- **Postgres schema changes stop at bronze.** `schema-change.enabled` keeps
-  bronze in sync, but silver and gold have fixed DDL, and dropping a column
-  `silver_job.sql` reads will fail the silver job.
-- **Resource footprint grew**: the TaskManager is now 4 GB with 8 slots.
-- **No monitoring stack.** Fluss ships an observability quickstart
-  (Prometheus/Grafana); not wired up here.
+[MIT](LICENSE)
